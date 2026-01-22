@@ -4,4 +4,4 @@ python main_thumos.py \
 --num_epochs 900 \
 --detection_inf_step 50 \
 --soft_nms \
---data_path DATA_PATH
+--data_path '../THUMOS14'
