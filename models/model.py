@@ -13,32 +13,35 @@ class BaseModel(nn.Module):
         self.num_classes = num_classes
         self.config = config
 
+        # 改进点五：Embedding 宽度扩张 (512 -> 768)
         self.base_module = nn.Sequential(
-            nn.Conv1d(in_channels=self.len_feature, out_channels=512, kernel_size=3, padding=1),
+            nn.Conv1d(in_channels=self.len_feature, out_channels=768, kernel_size=3, padding=1),
+            nn.BatchNorm1d(768),  # 改进点二：添加BatchNorm
             nn.ReLU(),
+            nn.Dropout(p=0.5),  # 改进点二：添加Dropout
         )
 
         self.cls = nn.Sequential(
-            nn.Conv1d(in_channels=512, out_channels=self.num_classes, kernel_size=1, padding=0),
+            nn.Conv1d(in_channels=768, out_channels=self.num_classes, kernel_size=1, padding=0),
         )
 
         self.action_module_rgb = nn.Sequential(
-            nn.Conv1d(in_channels=self.len_feature // 2, out_channels=512, kernel_size=3, padding=1),
+            nn.Conv1d(in_channels=self.len_feature // 2, out_channels=768, kernel_size=3, padding=1),
+            nn.BatchNorm1d(768),  # 改进点二：添加BatchNorm
             nn.ReLU(),
-            # nn.Dropout(p=0.5),
-            # nn.Conv1d(in_channels=512, out_channels=1, kernel_size=1, padding=0),
+            nn.Dropout(p=0.5),  # 改进点二：添加Dropout
         )
 
-        self.cls_rgb = nn.Conv1d(in_channels=512, out_channels=1, kernel_size=1, padding=0)
+        self.cls_rgb = nn.Conv1d(in_channels=768, out_channels=1, kernel_size=1, padding=0)
 
         self.action_module_flow = nn.Sequential(
-            nn.Conv1d(in_channels=self.len_feature // 2, out_channels=512, kernel_size=3, padding=1),
+            nn.Conv1d(in_channels=self.len_feature // 2, out_channels=768, kernel_size=3, padding=1),
+            nn.BatchNorm1d(768),  # 改进点二：添加BatchNorm
             nn.ReLU(),
-            # nn.Dropout(p=0.5),
-            # nn.Conv1d(in_channels=512, out_channels=1, kernel_size=1, padding=0),
+            nn.Dropout(p=0.5),  # 改进点二：添加Dropout
         )
 
-        self.cls_flow = nn.Conv1d(in_channels=512, out_channels=1, kernel_size=1, padding=0)
+        self.cls_flow = nn.Conv1d(in_channels=768, out_channels=1, kernel_size=1, padding=0)
 
         self.dropout = nn.Dropout(p=0.5)  # 0.5
 
@@ -53,17 +56,20 @@ class BaseModel(nn.Module):
         embedding_flow = emb_flow.permute(0, 2, 1)
         embedding_rgb = emb_rgb.permute(0, 2, 1)
 
-        action_flow = torch.sigmoid(self.cls_flow(emb_flow))
-        action_rgb = torch.sigmoid(self.cls_rgb(emb_rgb))
+        # 改进点三：Actionness 温度缩放 (除以0.7使输出更尖锐)
+        action_flow = torch.sigmoid(self.cls_flow(emb_flow) / 0.7)
+        action_rgb = torch.sigmoid(self.cls_rgb(emb_rgb) / 0.7)
 
         emb = self.base_module(input)
         embedding = emb.permute(0, 2, 1)
         # emb = self.dropout(emb)
         cas = self.cls(emb).permute(0, 2, 1)
         actionness1 = cas.sum(dim=2)
-        actionness1 = torch.sigmoid(actionness1)
+        # 改进点三：Actionness 温度缩放
+        actionness1 = torch.sigmoid(actionness1 / 0.7)
 
-        actionness2 = (action_flow + action_rgb)/2
+        # 改进点一：单分支 RGB + CAS + Flow加权 (0.7*action_rgb + 0.3*action_flow)
+        actionness2 = 0.7 * action_rgb + 0.3 * action_flow
         actionness2 = actionness2.squeeze(1)
 
         return cas, action_flow, action_rgb, actionness1, actionness2, embedding, embedding_flow, embedding_rgb
@@ -80,8 +86,9 @@ class AICL(nn.Module):
         self.softmax = nn.Softmax(dim=1)
         self.softmax_2 = nn.Softmax(dim=2)
 
-        self.r_C = 20
-        self.r_I = 20
+        # 改进点四：Top-k 调整 (r_C=25~30, r_I=30~35)
+        self.r_C = 25  # 调整为25~30
+        self.r_I = 35  # 调整为30~35
 
         self.dropout = nn.Dropout(p=0.6)
 
