@@ -42,19 +42,55 @@ class BaseModel(nn.Module):
 
         self.dropout = nn.Dropout(p=0.5)  # 0.5
 
+        # 混合分支
+        self.action_module_mixed1 = nn.Sequential(
+            nn.Conv1d(in_channels=self.len_feature // 2, out_channels=512, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+        self.cls_mixed1 = nn.Conv1d(512, 1, 1)
 
-    def forward(self, x):
+        self.action_module_mixed2 = nn.Sequential(
+            nn.Conv1d(in_channels=self.len_feature // 2, out_channels=512, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+        self.cls_mixed2 = nn.Conv1d(512, 1, 1)
+
+        # 门控模块 - 使用RGB、Flow和两个混合分支的特征进行门控
+        self.gate_module = nn.Sequential(
+            nn.Conv1d(512 * 4, 512, 3, padding=1),  # 4个512维特征拼接
+            nn.ReLU(),
+            nn.Conv1d(512, 4, 1),
+            nn.Softmax(dim=1)
+        )
+
+    def forward(self, x , inference= False):
         input = x.permute(0, 2, 1)
 
 
         emb_flow = self.action_module_flow(input[:, 1024:, :])
         emb_rgb = self.action_module_rgb(input[:, :1024, :])
 
+        # 混合分支
+        emb_mixed1 = self.action_module_mixed1(0.25 * input[:, :1024, :] + 0.75 * input[:, 1024:, :])
+        emb_mixed2 = self.action_module_mixed2(0.75 * input[:, :1024, :] + 0.25 * input[:, 1024:, :])
+
+        # 将RGB、Flow和两个混合分支的特征拼接用于门控
+        combined_for_gating = torch.cat([emb_rgb, emb_flow, emb_mixed1, emb_mixed2], dim=1)
+
+        # 门控
+        gate_weights = self.gate_module(combined_for_gating)
+        if inference:
+            # 软化门控
+            gate_weights = gate_weights * 0.7 + 0.3 / 4
+
+        rgb_w, flow_w, m1_w, m2_w = gate_weights[:, 0:1, :], gate_weights[:, 1:2, :], gate_weights[:, 2:3,
+                                                                                      :], gate_weights[:, 3:4, :]
+
         embedding_flow = emb_flow.permute(0, 2, 1)
         embedding_rgb = emb_rgb.permute(0, 2, 1)
 
-        action_flow = torch.sigmoid(self.cls_flow(emb_flow))
-        action_rgb = torch.sigmoid(self.cls_rgb(emb_rgb))
+        # action_flow = torch.sigmoid(self.cls_flow(emb_flow))
+        # action_rgb = torch.sigmoid(self.cls_rgb(emb_rgb))
 
         emb = self.base_module(input)
         embedding = emb.permute(0, 2, 1)
@@ -63,10 +99,30 @@ class BaseModel(nn.Module):
         actionness1 = cas.sum(dim=2)
         actionness1 = torch.sigmoid(actionness1)
 
-        actionness2 = (action_flow + action_rgb)/2
-        actionness2 = actionness2.squeeze(1)
+        action_rgb = torch.sigmoid(self.cls_rgb(emb_rgb)).squeeze(1)
+        action_flow = torch.sigmoid(self.cls_flow(emb_flow)).squeeze(1)
+        action_mixed1 = torch.sigmoid(self.cls_mixed1(emb_mixed1)).squeeze(1)
+        action_mixed2 = torch.sigmoid(self.cls_mixed2(emb_mixed2)).squeeze(1)
 
-        return cas, action_flow, action_rgb, actionness1, actionness2, embedding, embedding_flow, embedding_rgb
+        actionness2 = (rgb_w.squeeze(1) * action_rgb + flow_w.squeeze(1) * action_flow + \
+                           m1_w.squeeze(1) * action_mixed1 + m2_w.squeeze(1) * action_mixed2)
+
+        embedding_mixed1 = emb_mixed1.permute(0, 2, 1)
+        embedding_mixed2 = emb_mixed2.permute(0, 2, 1)
+
+        return (
+            cas,
+            action_flow,
+            action_rgb,
+            actionness1,
+            actionness2,
+            embedding,
+            embedding_flow,
+            embedding_rgb,
+            embedding_mixed1,
+            embedding_mixed2,
+            gate_weights
+        )
 
 
 class AICL(nn.Module):
@@ -129,7 +185,7 @@ class AICL(nn.Module):
         k_C = num_segments // self.r_C
         k_I = num_segments // self.r_I
 
-        cas, action_flow, action_rgb, actionness1, actionness2, embedding, embedding_flow, embedding_rgb = self.actionness_module(x)
+        cas, action_flow, action_rgb, actionness1, actionness2, embedding, embedding_flow, embedding_rgb, embedding_mixed1, embedding_mixed2, gate_weights = self.actionness_module(x)
 
         aness_np1 = actionness1.cpu().detach().numpy()
         aness_median1 = np.median(aness_np1, 1, keepdims=True)
@@ -149,6 +205,21 @@ class AICL(nn.Module):
 
         CAf, CBf = self.consistency_snippets_mining1(aness_bin1, aness_bin2, actionness1, embedding_flow, k_C)
         IAf, IBf = self.Inconsistency_snippets_mining1(aness_bin1, aness_bin2, actionness1, embedding_flow, k_I)
+
+        # Mixed branches contrastive learning
+        CAm1, CBm1 = self.consistency_snippets_mining1(
+            aness_bin1, aness_bin2, actionness1, embedding_mixed1, k_C
+        )
+        IAm1, IBm1 = self.Inconsistency_snippets_mining1(
+            aness_bin1, aness_bin2, actionness1, embedding_mixed1, k_I
+        )
+
+        CAm2, CBm2 = self.consistency_snippets_mining1(
+            aness_bin1, aness_bin2, actionness1, embedding_mixed2, k_C
+        )
+        IAm2, IBm2 = self.Inconsistency_snippets_mining1(
+            aness_bin1, aness_bin2, actionness1, embedding_mixed2, k_I
+        )
 
         contrast_pairs = {
             'CA': CA,
@@ -171,4 +242,7 @@ class AICL(nn.Module):
             'IB': IBf
         }
 
-        return cas, action_flow, action_rgb, contrast_pairs,contrast_pairs_r,contrast_pairs_f, actionness1, actionness2, aness_bin1, aness_bin2
+        contrast_pairs_m1 = {'CA': CAm1, 'CB': CBm1, 'IA': IAm1, 'IB': IBm1}
+        contrast_pairs_m2 = {'CA': CAm2, 'CB': CBm2, 'IA': IAm2, 'IB': IBm2}
+
+        return cas, action_flow, action_rgb, contrast_pairs,contrast_pairs_r,contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights

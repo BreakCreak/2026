@@ -120,6 +120,17 @@ class ContrastiveLoss(nn.Module):
         return loss
 
 
+def gate_entropy_loss(gate_weights):
+    """
+    避免 gate 退化成常数：
+    Args:
+        gate_weights: [B, 4, T]
+    """
+    p = gate_weights + 1e-6
+    entropy = -torch.sum(p * torch.log(p), dim=1)  # [B, T]
+    return entropy.mean()
+
+
 class ThumosTrainer():
     def __init__(self, config):
         # config
@@ -169,17 +180,31 @@ class ThumosTrainer():
         return torch.cat(cls_agnostic_gt, dim=0)  # B, 1, num_segments
 
 
-    def calculate_all_losses1(self, contrast_pairs, contrast_pairs_r,contrast_pairs_f, cas_top, label, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2):
+    def calculate_all_losses1(self, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, cas_top, label, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2, gate_weights):
         self.contrastive_criterion = ContrastiveLoss()
-        loss_contrastive = self.contrastive_criterion(contrast_pairs) + self.contrastive_criterion(contrast_pairs_r) + self.contrastive_criterion(contrast_pairs_f)
+        
+        # 原有的对比损失
+        L_c = self.contrastive_criterion(contrast_pairs)
+        L_r = self.contrastive_criterion(contrast_pairs_r)
+        L_f = self.contrastive_criterion(contrast_pairs_f)
+        
+        # 新增的mixed分支对比损失
+        L_m1 = self.contrastive_criterion(contrast_pairs_m1)
+        L_m2 = self.contrastive_criterion(contrast_pairs_m2)
+        
+        # 总对比损失
+        loss_contrastive = L_c + L_r + L_f + 0.3 * L_m1 + 0.5 * L_m2
 
         base_loss = self.criterion(cas_top, label)
         class_agnostic_loss = self.Lgce(action_flow.squeeze(1), cls_agnostic_gt.squeeze(1)) + self.Lgce(action_rgb.squeeze(1), cls_agnostic_gt.squeeze(1))
 
         modality_consistent_loss = 0.5 * F.mse_loss(action_flow, action_rgb) + 0.5 * F.mse_loss(action_rgb, action_flow)
         action_consistent_loss = 0.5 * F.mse_loss(actionness1, actionness2) + 0.5 * F.mse_loss(actionness2, actionness1)
+        
+        # 计算门控熵损失
+        gate_ent_loss = gate_entropy_loss(gate_weights)
 
-        cost = base_loss + class_agnostic_loss  + 5*modality_consistent_loss + 0.01*loss_contrastive + 0.1*action_consistent_loss
+        cost = base_loss + class_agnostic_loss + 5*modality_consistent_loss + 0.01*loss_contrastive + 0.1*action_consistent_loss + 0.01 * gate_ent_loss
 
         return cost
 
@@ -203,7 +228,7 @@ class ThumosTrainer():
 
 
     def forward_pass(self, _data):
-        cas, action_flow, action_rgb, contrast_pairs,contrast_pairs_r,contrast_pairs_f, actionness1, actionness2, aness_bin1, aness_bin2 = self.net(_data)
+        cas, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights = self.net(_data)
 
         combined_cas = misc_utils.instance_selection_function(torch.softmax(cas.detach(), -1),
                                                               action_flow.permute(0, 2, 1).detach(),
@@ -214,7 +239,7 @@ class ThumosTrainer():
         # _, topk_indices1 = torch.topk(combined_cas, r, dim=1)
         cas_top = torch.mean(torch.gather(cas, 1, topk_indices), dim=1)
 
-        return cas_top, topk_indices, action_flow, action_rgb, contrast_pairs,contrast_pairs_r,contrast_pairs_f, actionness1, actionness2, aness_bin1, aness_bin2
+        return cas_top, topk_indices, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights
 
 
     def train(self):
@@ -231,13 +256,13 @@ class ThumosTrainer():
                 self.optimizer.zero_grad()
 
                 # forward pass
-                cas_top, topk_indices, action_flow, action_rgb, contrast_pairs,contrast_pairs_r,contrast_pairs_f, actionness1, actionness2, aness_bin1, aness_bin2 = self.forward_pass(_data)
+                cas_top, topk_indices, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights = self.forward_pass(_data)
 
                 # calcualte pseudo target
                 cls_agnostic_gt = self.calculate_pesudo_target(batch_size, _label, topk_indices)
 
                 # losses
-                cost = self.calculate_all_losses1(contrast_pairs, contrast_pairs_r,contrast_pairs_f, cas_top, _label, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2)
+                cost = self.calculate_all_losses1(contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, cas_top, _label, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2, gate_weights)
 
                 cost.backward()
                 self.optimizer.step()
