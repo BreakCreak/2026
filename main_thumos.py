@@ -231,8 +231,8 @@ class ThumosTrainer():
         cas, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights = self.net(_data)
 
         combined_cas = misc_utils.instance_selection_function(torch.softmax(cas.detach(), -1),
-                                                              action_flow.permute(0, 2, 1).detach(),
-                                                              action_rgb.permute(0, 2, 1))
+                                                              action_flow.unsqueeze(2).detach(),
+                                                              action_rgb.unsqueeze(2))
 
 
         _, topk_indices = torch.topk(combined_cas, self.config.num_segments // 8, dim=1)

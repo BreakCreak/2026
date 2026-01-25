@@ -45,7 +45,7 @@ def inference(net, config, test_loader, model_file=None):
             # FORWARD PASS
             cas, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights = net(_data)        # cas:[1,750,20]  action_rgb:[1,1,750]
 
-            combined_cas = misc_utils.instance_selection_function(torch.softmax(cas.detach(), -1), action_flow.permute(0, 2, 1).detach(), action_rgb.permute(0, 2, 1))
+            combined_cas = misc_utils.instance_selection_function(torch.softmax(cas.detach(), -1), action_flow.unsqueeze(2).detach(), action_rgb.unsqueeze(2))
             _, topk_indices = torch.topk(combined_cas, config.num_segments // 8, dim=1)
 
             # class prediction
