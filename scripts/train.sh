@@ -1,7 +1,7 @@
 python main_thumos.py \
---exp_name Thumos_1 \
+--exp_name Thumos_3 \
 --model_name ThumosModel \
---num_epochs 900 \
+--num_epochs 400 \
 --detection_inf_step 50 \
 --soft_nms \
---data_path DATA_PATH
+--data_path '../THUMOS14'
