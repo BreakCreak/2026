@@ -6,6 +6,19 @@ import math
 import numpy as np
 torch.set_printoptions(profile="full")
 
+class MixedExpert(nn.Module):
+    def __init__(self, c_in, c_out=512):
+        super().__init__()
+        self.fusion = nn.Sequential(
+            nn.Conv1d(2*c_in, c_out, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv1d(c_out, c_out, kernel_size=3, padding=1)
+        )
+
+    def forward(self, rgb, flow):
+        x = torch.cat([rgb, flow], dim=1)  # [B, 2*C_in, T]
+        return self.fusion(x)
+
 class BaseModel(nn.Module):
     def __init__(self, len_feature, num_classes, config=None):
         super(BaseModel, self).__init__()
@@ -42,17 +55,11 @@ class BaseModel(nn.Module):
 
         self.dropout = nn.Dropout(p=0.5)  # 0.5
 
-        # 混合分支
-        self.action_module_mixed1 = nn.Sequential(
-            nn.Conv1d(in_channels=self.len_feature // 2, out_channels=512, kernel_size=3, padding=1),
-            nn.ReLU(),
-        )
+        # 混合专家模块 - 使用可学习融合
+        self.mixed_expert1 = MixedExpert(1024, 512)  # 输入1024，输出512
         self.cls_mixed1 = nn.Conv1d(512, 1, 1)
 
-        self.action_module_mixed2 = nn.Sequential(
-            nn.Conv1d(in_channels=self.len_feature // 2, out_channels=512, kernel_size=3, padding=1),
-            nn.ReLU(),
-        )
+        self.mixed_expert2 = MixedExpert(1024, 512)  # 输入1024，输出512
         self.cls_mixed2 = nn.Conv1d(512, 1, 1)
 
         # 门控模块 - 使用RGB、Flow和两个混合分支的特征进行门控
@@ -70,9 +77,15 @@ class BaseModel(nn.Module):
         emb_flow = self.action_module_flow(input[:, 1024:, :])
         emb_rgb = self.action_module_rgb(input[:, :1024, :])
 
-        # 混合分支
-        emb_mixed1 = self.action_module_mixed1(0.25 * input[:, :1024, :] + 0.75 * input[:, 1024:, :])
-        emb_mixed2 = self.action_module_mixed2(0.75 * input[:, :1024, :] + 0.25 * input[:, 1024:, :])
+        # 混合专家分支 - 可学习融合
+        emb_mixed1 = self.mixed_expert1(
+            input[:, :1024, :],
+            input[:, 1024:, :]
+        )
+        emb_mixed2 = self.mixed_expert2(
+            input[:, :1024, :],
+            input[:, 1024:, :]
+        )
 
         # 将RGB、Flow和两个混合分支的特征拼接用于门控
         combined_for_gating = torch.cat([emb_rgb, emb_flow, emb_mixed1, emb_mixed2], dim=1)
@@ -245,4 +258,5 @@ class AICL(nn.Module):
         contrast_pairs_m1 = {'CA': CAm1, 'CB': CBm1, 'IA': IAm1, 'IB': IBm1}
         contrast_pairs_m2 = {'CA': CAm2, 'CB': CBm2, 'IA': IAm2, 'IB': IBm2}
 
-        return cas, action_flow, action_rgb, contrast_pairs,contrast_pairs_r,contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights
+        # 返回 embedding_mixed1 和 embedding_mixed2 以供训练时使用
+        return cas, action_flow, action_rgb, contrast_pairs,contrast_pairs_r,contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights, embedding_mixed1, embedding_mixed2

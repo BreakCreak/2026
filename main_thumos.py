@@ -131,6 +131,24 @@ def gate_entropy_loss(gate_weights):
     return entropy.mean()
 
 
+def expert_diversity_loss(e1, e2):
+    """
+    专家多样性损失，防止两个混合专家学习到相同的表示
+    Args:
+        e1: 第一个专家的输出 [B, T, C]
+        e2: 第二个专家的输出 [B, T, C]
+    """
+    # 将张量转为 [B, C, T] 以便进行归一化
+    e1 = e1.permute(0, 2, 1)
+    e2 = e2.permute(0, 2, 1)
+    
+    # 对通道维度进行归一化
+    e1 = F.normalize(e1.mean(dim=1), dim=1)  # [B, T]
+    e2 = F.normalize(e2.mean(dim=1), dim=1)  # [B, T]
+    
+    return (e1 * e2).sum(dim=1).mean()
+
+
 class ThumosTrainer():
     def __init__(self, config):
         # config
@@ -180,7 +198,7 @@ class ThumosTrainer():
         return torch.cat(cls_agnostic_gt, dim=0)  # B, 1, num_segments
 
 
-    def calculate_all_losses1(self, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, cas_top, label, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2, gate_weights):
+    def calculate_all_losses1(self, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, cas_top, label, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2, gate_weights, embedding_mixed1, embedding_mixed2):
         self.contrastive_criterion = ContrastiveLoss()
         
         # 原有的对比损失
@@ -203,8 +221,11 @@ class ThumosTrainer():
         
         # 计算门控熵损失
         gate_ent_loss = gate_entropy_loss(gate_weights)
+        
+        # 计算专家多样性损失
+        expert_div_loss = expert_diversity_loss(embedding_mixed1, embedding_mixed2)
 
-        cost = base_loss + class_agnostic_loss + 5*modality_consistent_loss + 0.01*loss_contrastive + 0.1*action_consistent_loss + 0.01 * gate_ent_loss
+        cost = base_loss + class_agnostic_loss + 5*modality_consistent_loss + 0.01*loss_contrastive + 0.1*action_consistent_loss + 0.01 * gate_ent_loss + 0.1 * expert_div_loss
 
         return cost
 
@@ -228,7 +249,7 @@ class ThumosTrainer():
 
 
     def forward_pass(self, _data):
-        cas, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights = self.net(_data)
+        cas, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights, embedding_mixed1, embedding_mixed2 = self.net(_data)
 
         combined_cas = misc_utils.instance_selection_function(torch.softmax(cas.detach(), -1),
                                                               action_flow.unsqueeze(2).detach(),
@@ -239,7 +260,7 @@ class ThumosTrainer():
         # _, topk_indices1 = torch.topk(combined_cas, r, dim=1)
         cas_top = torch.mean(torch.gather(cas, 1, topk_indices), dim=1)
 
-        return cas_top, topk_indices, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights
+        return cas_top, topk_indices, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights, embedding_mixed1, embedding_mixed2
 
 
     def train(self):
@@ -256,13 +277,13 @@ class ThumosTrainer():
                 self.optimizer.zero_grad()
 
                 # forward pass
-                cas_top, topk_indices, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights = self.forward_pass(_data)
+                cas_top, topk_indices, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights, embedding_mixed1, embedding_mixed2 = self.forward_pass(_data)
 
                 # calcualte pseudo target
                 cls_agnostic_gt = self.calculate_pesudo_target(batch_size, _label, topk_indices)
 
                 # losses
-                cost = self.calculate_all_losses1(contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, cas_top, _label, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2, gate_weights)
+                cost = self.calculate_all_losses1(contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, cas_top, _label, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2, gate_weights, embedding_mixed1, embedding_mixed2)
 
                 cost.backward()
                 self.optimizer.step()
