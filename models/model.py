@@ -7,13 +7,34 @@ import numpy as np
 torch.set_printoptions(profile="full")
 
 class MixedExpert(nn.Module):
-    def __init__(self, c_in, c_out=512):
+    def __init__(self, c_in, c_out=512, bias_rgb=True):
         super().__init__()
+        self.bias_rgb = bias_rgb  # 如果为True，则偏向RGB；如果为False，则偏向Flow
+        
+        # 根据偏向性调整初始权重
         self.fusion = nn.Sequential(
             nn.Conv1d(2*c_in, c_out, kernel_size=1),
             nn.ReLU(),
             nn.Conv1d(c_out, c_out, kernel_size=3, padding=1)
         )
+        
+        # 初始化权重以体现偏向性
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """初始化权重以体现偏向性"""
+        # 对第一个卷积层进行特殊初始化以体现偏向性
+        conv1 = self.fusion[0]
+        with torch.no_grad():
+            # 为偏向的模态分配更大的初始权重
+            if self.bias_rgb:
+                # 偏向RGB（前半部分通道）
+                conv1.weight[:conv1.out_channels//2, :conv1.in_channels//2, :] *= 1.2  # 更关注RGB
+                conv1.weight[conv1.out_channels//2:, conv1.in_channels//2:, :] *= 1.0  # 较少关注Flow
+            else:
+                # 偏向Flow（后半部分通道）
+                conv1.weight[:conv1.out_channels//2, conv1.in_channels//2:, :] *= 1.2  # 更关注Flow
+                conv1.weight[conv1.out_channels//2:, :conv1.in_channels//2, :] *= 1.0  # 较少关注RGB
 
     def forward(self, rgb, flow):
         x = torch.cat([rgb, flow], dim=1)  # [B, 2*C_in, T]
@@ -55,11 +76,11 @@ class BaseModel(nn.Module):
 
         self.dropout = nn.Dropout(p=0.5)  # 0.5
 
-        # 混合专家模块 - 使用可学习融合
-        self.mixed_expert1 = MixedExpert(1024, 512)  # 输入1024，输出512
+        # 混合专家模块 - 使用可学习融合，带有明确偏向性
+        self.mixed_expert1 = MixedExpert(1024, 512, bias_rgb=True)   # 偏向RGB
         self.cls_mixed1 = nn.Conv1d(512, 1, 1)
 
-        self.mixed_expert2 = MixedExpert(1024, 512)  # 输入1024，输出512
+        self.mixed_expert2 = MixedExpert(1024, 512, bias_rgb=False)  # 偏向Flow
         self.cls_mixed2 = nn.Conv1d(512, 1, 1)
 
         # 门控模块 - 使用RGB、Flow和两个混合分支的特征进行门控
@@ -77,14 +98,14 @@ class BaseModel(nn.Module):
         emb_flow = self.action_module_flow(input[:, 1024:, :])
         emb_rgb = self.action_module_rgb(input[:, :1024, :])
 
-        # 混合专家分支 - 可学习融合
+        # 混合专家分支 - 可学习融合，带有明确偏向性
         emb_mixed1 = self.mixed_expert1(
-            input[:, :1024, :],
-            input[:, 1024:, :]
+            input[:, :1024, :],  # RGB branch
+            input[:, 1024:, :]   # Flow branch
         )
         emb_mixed2 = self.mixed_expert2(
-            input[:, :1024, :],
-            input[:, 1024:, :]
+            input[:, :1024, :],  # RGB branch
+            input[:, 1024:, :]   # Flow branch
         )
 
         # 将RGB、Flow和两个混合分支的特征拼接用于门控
