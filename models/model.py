@@ -7,34 +7,13 @@ import numpy as np
 torch.set_printoptions(profile="full")
 
 class MixedExpert(nn.Module):
-    def __init__(self, c_in, c_out=512, bias_rgb=True):
+    def __init__(self, c_in, c_out=512):
         super().__init__()
-        self.bias_rgb = bias_rgb  # 如果为True，则偏向RGB；如果为False，则偏向Flow
-        
-        # 根据偏向性调整初始权重
         self.fusion = nn.Sequential(
             nn.Conv1d(2*c_in, c_out, kernel_size=1),
             nn.ReLU(),
             nn.Conv1d(c_out, c_out, kernel_size=3, padding=1)
         )
-        
-        # 初始化权重以体现偏向性
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        """初始化权重以体现偏向性"""
-        # 对第一个卷积层进行特殊初始化以体现偏向性
-        conv1 = self.fusion[0]
-        with torch.no_grad():
-            # 为偏向的模态分配更大的初始权重
-            if self.bias_rgb:
-                # 偏向RGB（前半部分通道）
-                conv1.weight[:conv1.out_channels//2, :conv1.in_channels//2, :] *= 1.2  # 更关注RGB
-                conv1.weight[conv1.out_channels//2:, conv1.in_channels//2:, :] *= 1.0  # 较少关注Flow
-            else:
-                # 偏向Flow（后半部分通道）
-                conv1.weight[:conv1.out_channels//2, conv1.in_channels//2:, :] *= 1.2  # 更关注Flow
-                conv1.weight[conv1.out_channels//2:, :conv1.in_channels//2, :] *= 1.0  # 较少关注RGB
 
     def forward(self, rgb, flow):
         x = torch.cat([rgb, flow], dim=1)  # [B, 2*C_in, T]
@@ -76,52 +55,56 @@ class BaseModel(nn.Module):
 
         self.dropout = nn.Dropout(p=0.5)  # 0.5
 
-        # 混合专家模块 - 使用可学习融合，带有明确偏向性
-        self.mixed_expert1 = MixedExpert(1024, 512, bias_rgb=True)   # 偏向RGB
-        self.cls_mixed1 = nn.Conv1d(512, 1, 1)
+        # 混合专家模块 - 单一混合专家
+        self.mixed_expert = MixedExpert(1024, 512)
+        self.cls_mixed = nn.Conv1d(512, 1, 1)
 
-        self.mixed_expert2 = MixedExpert(1024, 512, bias_rgb=False)  # 偏向Flow
-        self.cls_mixed2 = nn.Conv1d(512, 1, 1)
-
-        # 门控模块 - 使用RGB、Flow和两个混合分支的特征进行门控
+        # 门控模块 - 用于选择RGB+Flow分支还是Mixed分支
         self.gate_module = nn.Sequential(
-            nn.Conv1d(512 * 4, 512, 3, padding=1),  # 4个512维特征拼接
+            nn.Conv1d(512 * 3, 512, 3, padding=1),  # RGB + Flow + Mixed = 3*512维特征拼接
             nn.ReLU(),
-            nn.Conv1d(512, 4, 1),
+            nn.Conv1d(512, 2, 1),  # 输出2个门控权重
             nn.Softmax(dim=1)
         )
 
-    def forward(self, x , inference= False):
+    def forward(self, x, inference=False):
         input = x.permute(0, 2, 1)
-
 
         emb_flow = self.action_module_flow(input[:, 1024:, :])
         emb_rgb = self.action_module_rgb(input[:, :1024, :])
 
-        # 混合专家分支 - 可学习融合，带有明确偏向性
-        emb_mixed1 = self.mixed_expert1(
-            input[:, :1024, :],  # RGB branch
-            input[:, 1024:, :]   # Flow branch
-        )
-        emb_mixed2 = self.mixed_expert2(
+        # 混合专家分支 - 单一混合专家
+        emb_mixed = self.mixed_expert(
             input[:, :1024, :],  # RGB branch
             input[:, 1024:, :]   # Flow branch
         )
 
-        # 将RGB、Flow和两个混合分支的特征拼接用于门控
-        combined_for_gating = torch.cat([emb_rgb, emb_flow, emb_mixed1, emb_mixed2], dim=1)
+        # 将RGB、Flow和Mixed分支的特征拼接用于门控
+        combined_for_gating = torch.cat([emb_rgb, emb_flow, emb_mixed], dim=1)
 
-        # 门控
+        # 门控 - 选择RGB+Flow分支还是Mixed分支
         gate_weights = self.gate_module(combined_for_gating)
         if inference:
             # 软化门控
-            gate_weights = gate_weights * 0.7 + 0.3 / 4
+            gate_weights = gate_weights * 0.7 + 0.3 / 2
 
-        rgb_w, flow_w, m1_w, m2_w = gate_weights[:, 0:1, :], gate_weights[:, 1:2, :], gate_weights[:, 2:3,
-                                                                                      :], gate_weights[:, 3:4, :]
+        # 分解门控权重
+        branch1_w, branch2_w = gate_weights[:, 0:1, :], gate_weights[:, 1:2, :]
+
+        # Branch 1: RGB + Flow 相加
+        emb_branch1 = emb_rgb + emb_flow  # 直接相加
+        action_branch1 = torch.sigmoid(self.cls_mixed(emb_branch1)).squeeze(1)
+
+        # Branch 2: Mixed 分支
+        emb_branch2 = emb_mixed
+        action_branch2 = torch.sigmoid(self.cls_mixed(emb_branch2)).squeeze(1)
+
+        # 使用门控权重选择两个分支
+        actionness_selected = branch1_w.squeeze(1) * action_branch1 + branch2_w.squeeze(1) * action_branch2
 
         embedding_flow = emb_flow.permute(0, 2, 1)
         embedding_rgb = emb_rgb.permute(0, 2, 1)
+        embedding_mixed = emb_mixed.permute(0, 2, 1)
 
         # action_flow = torch.sigmoid(self.cls_flow(emb_flow))
         # action_rgb = torch.sigmoid(self.cls_rgb(emb_rgb))
@@ -135,14 +118,9 @@ class BaseModel(nn.Module):
 
         action_rgb = torch.sigmoid(self.cls_rgb(emb_rgb)).squeeze(1)
         action_flow = torch.sigmoid(self.cls_flow(emb_flow)).squeeze(1)
-        action_mixed1 = torch.sigmoid(self.cls_mixed1(emb_mixed1)).squeeze(1)
-        action_mixed2 = torch.sigmoid(self.cls_mixed2(emb_mixed2)).squeeze(1)
 
-        actionness2 = (rgb_w.squeeze(1) * action_rgb + flow_w.squeeze(1) * action_flow + \
-                           m1_w.squeeze(1) * action_mixed1 + m2_w.squeeze(1) * action_mixed2)
-
-        embedding_mixed1 = emb_mixed1.permute(0, 2, 1)
-        embedding_mixed2 = emb_mixed2.permute(0, 2, 1)
+        # 最终的actionness2是门控选择的结果
+        actionness2 = actionness_selected
 
         return (
             cas,
@@ -153,8 +131,7 @@ class BaseModel(nn.Module):
             embedding,
             embedding_flow,
             embedding_rgb,
-            embedding_mixed1,
-            embedding_mixed2,
+            embedding_mixed,
             gate_weights
         )
 
@@ -219,7 +196,7 @@ class AICL(nn.Module):
         k_C = num_segments // self.r_C
         k_I = num_segments // self.r_I
 
-        cas, action_flow, action_rgb, actionness1, actionness2, embedding, embedding_flow, embedding_rgb, embedding_mixed1, embedding_mixed2, gate_weights = self.actionness_module(x)
+        cas, action_flow, action_rgb, actionness1, actionness2, embedding, embedding_flow, embedding_rgb, embedding_mixed, gate_weights = self.actionness_module(x)
 
         aness_np1 = actionness1.cpu().detach().numpy()
         aness_median1 = np.median(aness_np1, 1, keepdims=True)
@@ -240,19 +217,22 @@ class AICL(nn.Module):
         CAf, CBf = self.consistency_snippets_mining1(aness_bin1, aness_bin2, actionness1, embedding_flow, k_C)
         IAf, IBf = self.Inconsistency_snippets_mining1(aness_bin1, aness_bin2, actionness1, embedding_flow, k_I)
 
-        # Mixed branches contrastive learning
-        CAm1, CBm1 = self.consistency_snippets_mining1(
-            aness_bin1, aness_bin2, actionness1, embedding_mixed1, k_C
+        # Mixed branch contrastive learning
+        CAm, CBm = self.consistency_snippets_mining1(
+            aness_bin1, aness_bin2, actionness1, embedding_mixed, k_C
         )
-        IAm1, IBm1 = self.Inconsistency_snippets_mining1(
-            aness_bin1, aness_bin2, actionness1, embedding_mixed1, k_I
+        IAm, IBm = self.Inconsistency_snippets_mining1(
+            aness_bin1, aness_bin2, actionness1, embedding_mixed, k_I
         )
 
+        # 为混合专家分支添加额外的对比学习 - 使用门控权重来指导学习
+        # 当branch1_w较大（直接相加效果好）时，可能意味着混合专家需要改进
+        # 当branch2_w较大（混合专家效果好）时，说明混合专家学习得好
         CAm2, CBm2 = self.consistency_snippets_mining1(
-            aness_bin1, aness_bin2, actionness1, embedding_mixed2, k_C
+            aness_bin1, aness_bin2, actionness2, embedding_mixed, k_C
         )
         IAm2, IBm2 = self.Inconsistency_snippets_mining1(
-            aness_bin1, aness_bin2, actionness1, embedding_mixed2, k_I
+            aness_bin1, aness_bin2, actionness2, embedding_mixed, k_I
         )
 
         contrast_pairs = {
@@ -276,8 +256,8 @@ class AICL(nn.Module):
             'IB': IBf
         }
 
-        contrast_pairs_m1 = {'CA': CAm1, 'CB': CBm1, 'IA': IAm1, 'IB': IBm1}
+        contrast_pairs_m = {'CA': CAm, 'CB': CBm, 'IA': IAm, 'IB': IBm}
         contrast_pairs_m2 = {'CA': CAm2, 'CB': CBm2, 'IA': IAm2, 'IB': IBm2}
 
-        # 返回 embedding_mixed1 和 embedding_mixed2 以供训练时使用
-        return cas, action_flow, action_rgb, contrast_pairs,contrast_pairs_r,contrast_pairs_f, contrast_pairs_m1, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights, embedding_mixed1, embedding_mixed2
+        # 返回 embedding_mixed 和 gate_weights 以供训练时使用
+        return cas, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights, embedding_mixed
