@@ -226,22 +226,24 @@ class ThumosTrainer():
         # gate_weights: [B, 2, T] -> [B, 2, top_k]
         batch_size = gate_weights.size(0)
         
-        # 提取top-k区域的分支actionness
+        # 确保topk_indices维度与action_branch1和action_branch2匹配
+        # action_branch1: [B, T], action_branch2: [B, T], topk_indices: [B, top_k]
+        # 使用gather提取top-k区域的分支actionness
         action_branch1_topk = torch.gather(action_branch1, 1, topk_indices)  # [B, top_k]
         action_branch2_topk = torch.gather(action_branch2, 1, topk_indices)  # [B, top_k]
         
         # 计算每个分支在top-k区域的平均actionness（代表分支质量）
-        branch1_quality = action_branch1_topk.mean(dim=1)  # [B]
-        branch2_quality = action_branch2_topk.mean(dim=1)  # [B]
+        branch1_quality = action_branch1_topk.mean(dim=1, keepdim=True)  # [B, 1]
+        branch2_quality = action_branch2_topk.mean(dim=1, keepdim=True)  # [B, 1]
         
         # 比较两个分支的质量
         # 如果branch1_quality > branch2_quality，则branch1相对优势为1，branch2为0，反之亦然
-        mask_branch1_better = branch1_quality > branch2_quality  # [B]
+        mask_branch1_better = branch1_quality > branch2_quality  # [B, 1]
         
         # 创建相对优势张量 [B, 2, 1]
         relative_advantage = torch.zeros((batch_size, 2, 1), device=gate_weights.device)
-        relative_advantage[:, 0, :] = mask_branch1_better.float().unsqueeze(1)  # branch1的优势 [B, 1]
-        relative_advantage[:, 1, :] = (~mask_branch1_better).float().unsqueeze(1)  # branch2的优势 [B, 1]
+        relative_advantage[:, 0, :] = mask_branch1_better.float()  # branch1的优势 [B, 1]
+        relative_advantage[:, 1, :] = (~mask_branch1_better).float()  # branch2的优势 [B, 1]
         
         # 扩展topk_indices到门控权重维度
         expanded_indices = topk_indices.unsqueeze(1).expand(-1, 2, -1)  # [B, 2, top_k]
