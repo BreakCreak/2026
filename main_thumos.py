@@ -227,7 +227,12 @@ class ThumosTrainer():
         batch_size = gate_weights.size(0)
         
         # 确保topk_indices维度与action_branch1和action_branch2匹配
-        # action_branch1: [B, T], action_branch2: [B, T], topk_indices: [B, top_k]
+        # 检查topk_indices的形状，如果需要调整
+        if len(topk_indices.shape) != 2 or topk_indices.shape[0] != action_branch1.shape[0]:
+            # 如果topk_indices是其他形状，需要重新获取
+            _, temp_topk_indices = torch.topk(action_branch1, min(10, action_branch1.size(1)), dim=1)
+            topk_indices = temp_topk_indices
+        
         # 使用gather提取top-k区域的分支actionness
         action_branch1_topk = torch.gather(action_branch1, 1, topk_indices)  # [B, top_k]
         action_branch2_topk = torch.gather(action_branch2, 1, topk_indices)  # [B, top_k]
