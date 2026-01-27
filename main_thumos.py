@@ -122,13 +122,32 @@ class ContrastiveLoss(nn.Module):
 
 def gate_entropy_loss(gate_weights):
     """
-    避免 gate 退化成常数：
+    门控熵正则化：防止门控权重退化为常数，鼓励更多样化的分支选择
     Args:
         gate_weights: [B, 2, T] (现在是2个分支)
     """
-    p = gate_weights + 1e-6
+    p = gate_weights + 1e-6  # 防止log(0)
     entropy = -torch.sum(p * torch.log(p), dim=1)  # [B, T]
     return entropy.mean()
+
+
+def branch_balance_loss(gate_weights):
+    """
+    分支平衡损失：防止某个分支被永久忽略
+    Args:
+        gate_weights: [B, 2, T]
+    """
+    # 计算每个分支在整个序列上的平均激活值
+    avg_activation = torch.mean(gate_weights, dim=2)  # [B, 2]
+    
+    # 计算批次级别平均激活值
+    batch_avg = torch.mean(avg_activation, dim=0)  # [2]
+    
+    # 希望两个分支都被激活（理想情况下每个分支平均激活率为0.5）
+    ideal_ratio = 0.5
+    balance_loss = torch.mean((batch_avg - ideal_ratio) ** 2)
+    
+    return balance_loss
 
 
 def expert_diversity_loss(e1, e2):
@@ -267,14 +286,18 @@ class ThumosTrainer():
 
         modality_consistent_loss = 0.5 * F.mse_loss(action_flow, action_rgb) + 0.5 * F.mse_loss(action_rgb, action_flow)
         action_consistent_loss = 0.5 * F.mse_loss(actionness1, actionness2) + 0.5 * F.mse_loss(actionness2, actionness1)
-        
+    
         # 计算门控熵损失
         gate_ent_loss = gate_entropy_loss(gate_weights)
-        
+    
+        # 计算分支平衡损失
+        gate_balance_loss = branch_balance_loss(gate_weights)
+    
         # 增强的门控反馈机制
         gate_feedback_loss = self.calculate_gate_feedback_loss(gate_weights, action_branch1, action_branch2, topk_indices)
 
-        cost = base_loss + class_agnostic_loss + 5*modality_consistent_loss + 0.01*loss_contrastive + 0.1*action_consistent_loss + 0.01 * gate_ent_loss + 0.05 * gate_feedback_loss
+        # 添加门控正则化项
+        cost = base_loss + class_agnostic_loss + 5*modality_consistent_loss + 0.01*loss_contrastive + 0.1*action_consistent_loss + 0.01 * gate_ent_loss + 0.02 * gate_balance_loss + 0.05 * gate_feedback_loss
 
         return cost
 
