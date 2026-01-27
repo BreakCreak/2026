@@ -197,8 +197,49 @@ class ThumosTrainer():
 
         return torch.cat(cls_agnostic_gt, dim=0)  # B, 1, num_segments
 
+    def calculate_gate_feedback_loss(self, gate_weights, action_branch1, action_branch2, topk_indices):
+        """
+        计算门控反馈损失，让门控能够感知到选择的准确性
+        如果门控选择了某个分支，而该分支实际表现更好，则给予正反馈
+        如果门控选择了某个分支，但另一个分支表现更好，则给予负反馈
+        """
+        # 获取top-k区域的门控权重和分支actionness
+        # gate_weights: [B, 2, T] -> [B, 2, top_k]
+        batch_size = gate_weights.size(0)
+        
+        # 提取top-k区域的分支actionness
+        action_branch1_topk = torch.gather(action_branch1, 1, topk_indices)  # [B, top_k]
+        action_branch2_topk = torch.gather(action_branch2, 1, topk_indices)  # [B, top_k]
+        
+        # 计算每个分支在top-k区域的平均actionness（代表分支质量）
+        branch1_quality = action_branch1_topk.mean(dim=1)  # [B]
+        branch2_quality = action_branch2_topk.mean(dim=1)  # [B]
+        
+        # 比较两个分支的质量
+        # 如果branch1_quality > branch2_quality，则branch1相对优势为1，branch2为0，反之亦然
+        mask_branch1_better = branch1_quality > branch2_quality  # [B]
+        
+        # 创建相对优势张量 [B, 2, 1]
+        relative_advantage = torch.zeros((batch_size, 2, 1), device=gate_weights.device)
+        relative_advantage[:, 0, :] = mask_branch1_better.float().unsqueeze(1)  # branch1的优势 [B, 1]
+        relative_advantage[:, 1, :] = (~mask_branch1_better).float().unsqueeze(1)  # branch2的优势 [B, 1]
+        
+        # 扩展topk_indices到门控权重维度
+        expanded_indices = topk_indices.unsqueeze(1).expand(-1, 2, -1)  # [B, 2, top_k]
+        
+        # 提取top-k区域的门控权重
+        gate_weights_topk = torch.gather(gate_weights, 2, expanded_indices)  # [B, 2, top_k]
+        
+        # 计算门控权重与理想选择之间的差距
+        # 计算top-k区域的平均门控权重 [B, 2, 1]
+        avg_gate_weights = gate_weights_topk.mean(dim=2, keepdim=True)  # [B, 2, 1]
+        
+        # 计算门控反馈损失：门控权重与理想选择越接近，损失越小
+        gate_feedback_loss = F.mse_loss(avg_gate_weights, relative_advantage)
+        
+        return gate_feedback_loss
 
-    def calculate_all_losses1(self, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, cas_top, label, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2, gate_weights, embedding_mixed):
+    def calculate_all_losses1(self, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, contrast_pairs_b1, contrast_pairs_b1_2, contrast_pairs_b1_ind, contrast_pairs_m_ind, cas_top, label, topk_indices, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2, gate_weights, embedding_mixed, embedding_branch1, action_branch1, action_branch2):
         self.contrastive_criterion = ContrastiveLoss()
         
         # 原有的对比损失
@@ -206,14 +247,20 @@ class ThumosTrainer():
         L_r = self.contrastive_criterion(contrast_pairs_r)
         L_f = self.contrastive_criterion(contrast_pairs_f)
         
-        # 原来的mixed分支对比损失（使用actionness1）
+        # 混合分支对比损失
         L_m = self.contrastive_criterion(contrast_pairs_m)
-        
-        # 新增的mixed分支对比损失（使用actionness2，即门控选择后的结果）
         L_m2 = self.contrastive_criterion(contrast_pairs_m2)
         
+        # RGB+Flow相加分支对比损失
+        L_b1 = self.contrastive_criterion(contrast_pairs_b1)
+        L_b1_2 = self.contrastive_criterion(contrast_pairs_b1_2)
+        
+        # 分支独立对比损失（用于门控反馈）
+        L_b1_ind = self.contrastive_criterion(contrast_pairs_b1_ind)
+        L_m_ind = self.contrastive_criterion(contrast_pairs_m_ind)
+        
         # 总对比损失
-        loss_contrastive = L_c + L_r + L_f + 0.5 * L_m + 0.3 * L_m2
+        loss_contrastive = L_c + L_r + L_f + 0.5 * L_m + 0.3 * L_m2 + 0.5 * L_b1 + 0.3 * L_b1_2 + 0.4 * L_b1_ind + 0.4 * L_m_ind
 
         base_loss = self.criterion(cas_top, label)
         class_agnostic_loss = self.Lgce(action_flow.squeeze(1), cls_agnostic_gt.squeeze(1)) + self.Lgce(action_rgb.squeeze(1), cls_agnostic_gt.squeeze(1))
@@ -223,8 +270,11 @@ class ThumosTrainer():
         
         # 计算门控熵损失
         gate_ent_loss = gate_entropy_loss(gate_weights)
+        
+        # 增强的门控反馈机制
+        gate_feedback_loss = self.calculate_gate_feedback_loss(gate_weights, action_branch1, action_branch2, topk_indices)
 
-        cost = base_loss + class_agnostic_loss + 5*modality_consistent_loss + 0.01*loss_contrastive + 0.1*action_consistent_loss + 0.01 * gate_ent_loss
+        cost = base_loss + class_agnostic_loss + 5*modality_consistent_loss + 0.01*loss_contrastive + 0.1*action_consistent_loss + 0.01 * gate_ent_loss + 0.05 * gate_feedback_loss
 
         return cost
 
@@ -248,7 +298,7 @@ class ThumosTrainer():
 
 
     def forward_pass(self, _data):
-        cas, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights, embedding_mixed = self.net(_data)
+        cas, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, contrast_pairs_b1, contrast_pairs_b1_2, contrast_pairs_b1_ind, contrast_pairs_m_ind, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights, embedding_mixed, embedding_branch1, action_branch1, action_branch2 = self.net(_data)
 
         combined_cas = misc_utils.instance_selection_function(torch.softmax(cas.detach(), -1),
                                                               action_flow.unsqueeze(2).detach(),
@@ -259,7 +309,7 @@ class ThumosTrainer():
         # _, topk_indices1 = torch.topk(combined_cas, r, dim=1)
         cas_top = torch.mean(torch.gather(cas, 1, topk_indices), dim=1)
 
-        return cas_top, topk_indices, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights, embedding_mixed
+        return cas_top, topk_indices, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, contrast_pairs_b1, contrast_pairs_b1_2, contrast_pairs_b1_ind, contrast_pairs_m_ind, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights, embedding_mixed, embedding_branch1, action_branch1, action_branch2
 
 
     def train(self):
@@ -276,13 +326,13 @@ class ThumosTrainer():
                 self.optimizer.zero_grad()
 
                 # forward pass
-                cas_top, topk_indices, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights, embedding_mixed = self.forward_pass(_data)
+                cas_top, topk_indices, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, contrast_pairs_b1, contrast_pairs_b1_2, contrast_pairs_b1_ind, contrast_pairs_m_ind, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights, embedding_mixed, embedding_branch1 = self.forward_pass(_data)
 
                 # calcualte pseudo target
                 cls_agnostic_gt = self.calculate_pesudo_target(batch_size, _label, topk_indices)
 
                 # losses
-                cost = self.calculate_all_losses1(contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, cas_top, _label, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2, gate_weights, embedding_mixed)
+                cost = self.calculate_all_losses1(contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, contrast_pairs_b1, contrast_pairs_b1_2, contrast_pairs_b1_ind, contrast_pairs_m_ind, cas_top, _label, topk_indices, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2, gate_weights, embedding_mixed, embedding_branch1, action_branch1, action_branch2)
 
                 cost.backward()
                 self.optimizer.step()
