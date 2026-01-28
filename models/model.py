@@ -4,17 +4,19 @@ import torch.nn.functional as F
 import torch.nn.init as torch_init
 import math
 import numpy as np
+
 torch.set_printoptions(profile="full")
+
 
 class MixedExpert(nn.Module):
     def __init__(self, c_in, c_out=512):  # 输出维度改为512
         super().__init__()
         self.fusion = nn.Sequential(
-            nn.Conv1d(2*c_in, c_out, kernel_size=1),
+            nn.Conv1d(2 * c_in, c_out, kernel_size=1),
             nn.ReLU(),
             nn.Conv1d(c_out, c_out, kernel_size=3, padding=1)
         )
-        
+
         # 通道注意力机制
         self.channel_att = nn.Sequential(
             nn.AdaptiveAvgPool1d(1),  # 全局平均池化 [B, C, 1]
@@ -27,12 +29,13 @@ class MixedExpert(nn.Module):
     def forward(self, rgb, flow):
         x = torch.cat([rgb, flow], dim=1)  # [B, 2*C_in, T] -> [B, 2*c_in, T]
         x = self.fusion(x)  # [B, c_out, T]
-        
+
         # 应用通道注意力
         att_weights = self.channel_att(x)  # [B, c_out, 1]
         x = x * att_weights  # [B, c_out, T] * [B, c_out, 1] -> [B, c_out, T]
-        
+
         return x
+
 
 class BaseModel(nn.Module):
     def __init__(self, len_feature, num_classes, config=None):
@@ -84,11 +87,28 @@ class BaseModel(nn.Module):
             nn.ReLU(),
             nn.Conv1d(512, 2, 1),  # 输出2个门控logits
         )
-        
+
+        # 分支评估模块 - 用于计算分支权重
+        self.branch_score_net = nn.Sequential(
+            nn.Conv1d(512 + 512, 512, 3, padding=1),  # Branch1 (512) + Mixed (512) = 1024维
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),  # 时间维度池化
+            nn.Flatten(),
+            nn.Linear(512, 128),  # 全连接层
+            nn.ReLU(),
+            nn.Linear(128, 2)  # 输出2个分支的评分
+        )
+
         # Gumbel-Softmax的温度参数
         self.tau = 1.0  # 温度参数，控制输出的平滑程度
 
-    def forward(self, x, inference=False):
+        # 原始base_model的权重系数 - 用于warm-up阶段
+        self.base_weight = nn.Parameter(torch.tensor(0.5))  # 可学习的权重
+
+        # 蒸馏温度
+        self.distill_temp = 3.0
+
+    def forward(self, x, inference=False, epoch=0):
         input = x.permute(0, 2, 1)
 
         emb_flow = self.action_module_flow(input[:, 1024:, :])
@@ -100,23 +120,44 @@ class BaseModel(nn.Module):
         # 混合专家分支 - 输出维度为512
         emb_mixed = self.mixed_expert(
             emb_rgb,  # RGB branch (已处理的特征)
-            emb_flow   # Flow branch (已处理的特征)
+            emb_flow  # Flow branch (已处理的特征)
         )  # [B, 512, T]
 
-        # 将Branch1和Mixed分支的特征拼接用于门控
-        combined_for_gating = torch.cat([emb_branch1, emb_mixed], dim=1)  # [B, 512+512=1024, T]
+        # 分支1: RGB + Flow 相加（分别分类再加和）
+        action_branch1_raw = torch.sigmoid(self.cls_rgb(emb_rgb)).squeeze(1) + torch.sigmoid(
+            self.cls_flow(emb_flow)).squeeze(1)  # [B, T]，使用原始的分类头
 
-        # 门控 - 选择RGB+Flow分支还是Mixed分支 (二值选择)
-        gate_logits = self.gate_logits(combined_for_gating)  # [B, 2, T]
+        # 分支2: Mixed 分支
+        action_branch2_raw = torch.sigmoid(self.cls_mixed(emb_mixed)).squeeze(1)  # [B, T]
+
+        # 计算分支得分 - 用于软教师机制
+        combined_for_scoring = torch.cat([emb_branch1, emb_mixed], dim=1)  # [B, 512+512=1024, T]
+        branch_scores_raw = self.branch_score_net(combined_for_scoring)  # [B, 2]
         
-        # 使用Gumbel-Softmax进行门控选择，支持梯度传递
+        # 将分数扩展到时间维度，以便与actionness对齐
+        branch_scores_expanded = branch_scores_raw.unsqueeze(-1).expand(-1, -1, action_branch1_raw.size(1))  # [B, 2, T]
+        
+        # 使用softmax计算动态权重
+        branch_weights = F.softmax(branch_scores_expanded, dim=1)  # [B, 2, T]
+        
+        # 动态加权融合两个分支
+        action_branch1 = action_branch1_raw.unsqueeze(1)  # [B, 1, T]
+        action_branch2 = action_branch2_raw.unsqueeze(1)  # [B, 1, T]
+        action_branches_combined = torch.cat([action_branch1, action_branch2], dim=1)  # [B, 2, T]
+        
+        # 软教师机制：动态加权融合
+        soft_teacher = torch.sum(branch_weights * action_branches_combined, dim=1)  # [B, T]
+
+        # 门控模块 - 保持原有的门控功能
+        combined_for_gating = torch.cat([emb_branch1, emb_mixed], dim=1)  # [B, 512+512=1024, T]
+        gate_logits = self.gate_logits(combined_for_gating)  # [B, 2, T]
         gate_weights = F.gumbel_softmax(
             gate_logits,
             tau=self.tau,
             hard=not self.training,  # 训练时使用软选择，推理时使用硬选择
             dim=1
         )  # [B, 2, T]
-        
+
         # 在推理时，我们仍然可以通过argmax获得硬选择
         if not self.training:
             # 推理时使用硬选择，但训练时保持可微分
@@ -128,14 +169,8 @@ class BaseModel(nn.Module):
             # 训练时使用Gumbel-Softmax的输出
             branch1_w, branch2_w = gate_weights[:, 0:1, :], gate_weights[:, 1:2, :]
 
-        # 分支1: RGB + Flow 相加（分别分类再加和）
-        action_branch1 = torch.sigmoid(self.cls_rgb(emb_rgb)).squeeze(1) + torch.sigmoid(self.cls_flow(emb_flow)).squeeze(1)  # [B, T]，使用原始的分类头
-
-        # 分支2: Mixed 分支
-        action_branch2 = torch.sigmoid(self.cls_mixed(emb_mixed)).squeeze(1)  # [B, T]
-
         # 使用门控权重选择两个分支
-        actionness_selected = branch1_w.squeeze(1) * action_branch1 + branch2_w.squeeze(1) * action_branch2
+        actionness_selected = branch1_w.squeeze(1) * action_branch1_raw + branch2_w.squeeze(1) * action_branch2_raw
 
         # 保存用于对比学习的嵌入
         embedding_flow = emb_flow.permute(0, 2, 1)
@@ -147,12 +182,19 @@ class BaseModel(nn.Module):
         embedding = emb.permute(0, 2, 1)
         # emb = self.dropout(emb)
         cas = self.cls(emb).permute(0, 2, 1)
-        actionness1 = cas.sum(dim=2)
-        actionness1 = torch.sigmoid(actionness1)
+        actionness_base = cas.sum(dim=2)
+        actionness_base = torch.sigmoid(actionness_base)
 
         action_rgb = torch.sigmoid(self.cls_rgb(emb_rgb)).squeeze(1)
         action_flow = torch.sigmoid(self.cls_flow(emb_flow)).squeeze(1)
 
+        # 根据epoch调整base_model的权重，实现warm-up
+        warmup_ratio = min(1.0, epoch / 10.0)  # 前10个epoch逐渐减少base_model权重
+        base_weight_adjusted = self.base_weight * (1 - warmup_ratio)
+        
+        # actionness1现在是软教师（当前最强分支的输出）
+        actionness1 = base_weight_adjusted * actionness_base + (1 - base_weight_adjusted) * soft_teacher
+        
         # 最终的actionness2是门控选择的结果
         actionness2 = actionness_selected
 
@@ -160,7 +202,7 @@ class BaseModel(nn.Module):
             cas,
             action_flow,
             action_rgb,
-            actionness1,
+            actionness1,  # 现在是软教师机制的输出
             actionness2,
             embedding,
             embedding_flow,
@@ -168,8 +210,10 @@ class BaseModel(nn.Module):
             embedding_mixed,
             embedding_branch1,  # 新增：RGB+Flow相加后的嵌入
             gate_weights,
-            action_branch1,  # 新增：分支1的actionness
-            action_branch2   # 新增：分支2的actionness
+            action_branch1_raw,  # 新增：分支1的原始actionness
+            action_branch2_raw,  # 新增：分支2的原始actionness
+            branch_weights,      # 新增：分支权重
+            soft_teacher         # 新增：软教师输出
         )
 
 
@@ -197,7 +241,6 @@ class AICL(nn.Module):
         return selected_embeddings
 
     def consistency_snippets_mining1(self, aness_bin1, aness_bin2, actionness1, embeddings, k_easy):
-
         x = aness_bin1 + aness_bin2
         select_idx_act = actionness1.new_tensor(np.where(x == 2, 1, 0))
         # print(torch.min(torch.sum(select_idx_act, dim=-1)))
@@ -212,11 +255,9 @@ class AICL(nn.Module):
         easy_act = self.select_topk_embeddings(actionness_act, embeddings, k_easy)
         easy_bkg = self.select_topk_embeddings(actionness_bg, embeddings, k_easy)
 
-
         return easy_act, easy_bkg
 
     def Inconsistency_snippets_mining1(self, aness_bin1, aness_bin2, actionness1, embeddings, k_hard):
-
         x = aness_bin1 + aness_bin2
         idx_region_inner = actionness1.new_tensor(np.where(x == 1, 1, 0))
         aness_region_inner = actionness1 * idx_region_inner
@@ -228,12 +269,13 @@ class AICL(nn.Module):
 
         return hard_act, hard_bkg
 
-    def forward(self, x):
+    def forward(self, x, epoch=0):
         num_segments = x.shape[1]
         k_C = num_segments // self.r_C
         k_I = num_segments // self.r_I
 
-        cas, action_flow, action_rgb, actionness1, actionness2, embedding, embedding_flow, embedding_rgb, embedding_mixed, embedding_branch1, gate_weights, action_branch1, action_branch2 = self.actionness_module(x)
+        cas, action_flow, action_rgb, actionness1, actionness2, embedding, embedding_flow, embedding_rgb, embedding_mixed, embedding_branch1, gate_weights, action_branch1, action_branch2, branch_weights, soft_teacher = self.actionness_module.forward(
+            x, inference=False, epoch=epoch)
 
         aness_np1 = actionness1.cpu().detach().numpy()
         aness_median1 = np.median(aness_np1, 1, keepdims=True)
@@ -246,7 +288,7 @@ class AICL(nn.Module):
         # 为分支1和分支2也计算二值化掩码，用于各自的对比学习
         action_branch1_np = action_branch1.cpu().detach().numpy()
         action_branch1_bin = np.where(action_branch1_np > np.median(action_branch1_np, 1, keepdims=True), 1.0, 0.0)
-        
+
         action_branch2_np = action_branch2.cpu().detach().numpy()
         action_branch2_bin = np.where(action_branch2_np > np.median(action_branch2_np, 1, keepdims=True), 1.0, 0.0)
 
@@ -301,7 +343,7 @@ class AICL(nn.Module):
         IBb1_ind, IBb1_ind_ = self.Inconsistency_snippets_mining1(
             action_branch1_bin, action_branch1_bin, action_branch1, embedding_branch1, k_I
         )
-        
+
         # Branch2单独的对比对
         CAm_ind, CBm_ind = self.consistency_snippets_mining1(
             action_branch2_bin, action_branch2_bin, action_branch2, embedding_mixed, k_C

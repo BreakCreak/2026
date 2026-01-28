@@ -265,7 +265,7 @@ class ThumosTrainer():
         
         return gate_feedback_loss
 
-    def calculate_all_losses1(self, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, contrast_pairs_b1, contrast_pairs_b1_2, contrast_pairs_b1_ind, contrast_pairs_m_ind, cas_top, label, topk_indices, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2, gate_weights, embedding_mixed, embedding_branch1, action_branch1, action_branch2):
+    def calculate_all_losses1(self, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, contrast_pairs_b1, contrast_pairs_b1_2, contrast_pairs_b1_ind, contrast_pairs_m_ind, cas_top, label, topk_indices, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2, gate_weights, embedding_mixed, embedding_branch1, action_branch1, action_branch2, epoch=0):
         self.contrastive_criterion = ContrastiveLoss()
         
         # 原有的对比损失
@@ -302,9 +302,38 @@ class ThumosTrainer():
     
         # 增强的门控反馈机制
         gate_feedback_loss = self.calculate_gate_feedback_loss(gate_weights, action_branch1, action_branch2, topk_indices)
-
+        
+        # 蒸馏损失：使用软教师机制让较弱分支从较强分支学习
+        # 计算每个分支的性能（基于actionness的置信度）
+        branch1_confidence = torch.mean(action_branch1, dim=1)  # [B]
+        branch2_confidence = torch.mean(action_branch2, dim=1)  # [B]
+        
+        # 判断哪个分支更强
+        branch1_is_stronger = branch1_confidence > branch2_confidence
+        
+        # 计算蒸馏损失
+        distill_loss = 0.0
+        if torch.any(branch1_is_stronger):  # branch1更强，branch2向branch1学习
+            strong_mask = branch1_is_stronger.float().unsqueeze(1)  # [B, 1]
+            weak_branch_output = action_branch2 * strong_mask.expand_as(action_branch2)
+            strong_branch_output = action_branch1 * strong_mask.expand_as(action_branch1)
+            distill_loss += self.distill_loss(weak_branch_output, strong_branch_output)
+        
+        if torch.any(~branch1_is_stronger):  # branch2更强，branch1向branch2学习
+            strong_mask = (~branch1_is_stronger).float().unsqueeze(1)  # [B, 1]
+            weak_branch_output = action_branch1 * strong_mask.expand_as(action_branch1)
+            strong_branch_output = action_branch2 * strong_mask.expand_as(action_branch2)
+            distill_loss += self.distill_loss(weak_branch_output, strong_branch_output)
+        
+        # 相互学习损失
+        mutual_loss = self.mutual_learning_loss(action_branch1, action_branch2)
+        
+        # 根据epoch调整蒸馏损失权重，在warm-up阶段更强调蒸馏
+        warmup_ratio = min(1.0, epoch / 5.0)  # 前5个epoch逐渐减少蒸馏权重
+        distill_weight = 0.1 * (1 - warmup_ratio + 0.1)  # 初始权重较高，随训练进行逐渐降低
+        
         # 添加门控正则化项
-        cost = base_loss + class_agnostic_loss + 5*modality_consistent_loss + 0.01*loss_contrastive + 0.1*action_consistent_loss + 0.01 * gate_ent_loss + 0.02 * gate_balance_loss + 0.05 * gate_feedback_loss
+        cost = base_loss + class_agnostic_loss + 5*modality_consistent_loss + 0.01*loss_contrastive + 0.1*action_consistent_loss + 0.01 * gate_ent_loss + 0.02 * gate_balance_loss + 0.05 * gate_feedback_loss + distill_weight * distill_loss + 0.05 * mutual_loss
 
         return cost
 
@@ -326,8 +355,8 @@ class ThumosTrainer():
 
             self.total_loss_per_epoch = 0
 
-    def forward_pass(self, _data):
-        cas, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, contrast_pairs_b1, contrast_pairs_b1_2, contrast_pairs_b1_ind, contrast_pairs_m_ind, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights, embedding_mixed, embedding_branch1, action_branch1, action_branch2 = self.net(_data)
+    def forward_pass(self, _data, epoch=0):
+        cas, action_flow, action_rgb, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, contrast_pairs_b1, contrast_pairs_b1_2, contrast_pairs_b1_ind, contrast_pairs_m_ind, actionness1, actionness2, aness_bin1, aness_bin2, gate_weights, embedding_mixed, embedding_branch1, action_branch1, action_branch2 = self.net(_data, epoch=epoch)
 
         combined_cas = misc_utils.instance_selection_function(torch.softmax(cas.detach(), -1),
                                                               action_flow.unsqueeze(2).detach(),
