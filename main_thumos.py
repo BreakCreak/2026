@@ -16,6 +16,7 @@ from utils import misc_utils
 from torch.utils.data import Dataset
 from dataset.thumos_features import ThumosFeature
 from utils.loss import CrossEntropyLoss, GeneralizedCE
+from utils.distill_loss import DistillationLoss, AdaptiveDistillationLoss, MutualLearningLoss
 from config.config_thumos import Config, parse_args, class_dict
 from models.model import AICL
 
