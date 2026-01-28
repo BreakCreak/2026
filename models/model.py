@@ -45,12 +45,12 @@ class BaseModel(nn.Module):
         self.config = config
 
         self.base_module = nn.Sequential(
-            nn.Conv1d(in_channels=self.len_feature, out_channels=512, kernel_size=3, padding=1),
+            nn.Conv1d(in_channels=self.len_feature, out_channels=768, kernel_size=3, padding=1),
             nn.ReLU(),
         )
 
         self.cls = nn.Sequential(
-            nn.Conv1d(in_channels=512, out_channels=self.num_classes, kernel_size=1, padding=0),
+            nn.Conv1d(in_channels=768, out_channels=self.num_classes, kernel_size=1, padding=0),
         )
 
         self.action_module_rgb = nn.Sequential(

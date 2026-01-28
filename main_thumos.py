@@ -184,6 +184,11 @@ class ThumosTrainer():
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=self.config.lr, betas=(0.9, 0.999), weight_decay=0.0005)
         self.criterion = CrossEntropyLoss()
         self.Lgce = GeneralizedCE(q=self.config.q_val)
+        
+        # 蒸馏损失
+        self.distill_loss = DistillationLoss(temperature=3.0)
+        self.adaptive_distill_loss = AdaptiveDistillationLoss(temperature=3.0)
+        self.mutual_learning_loss = MutualLearningLoss(temperature=3.0)
 
         # parameters
         self.best_mAP = -1 # init
@@ -389,7 +394,7 @@ class ThumosTrainer():
                 cls_agnostic_gt = self.calculate_pesudo_target(batch_size, _label, topk_indices)
 
                 # losses
-                cost = self.calculate_all_losses1(contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, contrast_pairs_b1, contrast_pairs_b1_2, contrast_pairs_b1_ind, contrast_pairs_m_ind, cas_top, _label, topk_indices, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2, gate_weights, embedding_mixed, embedding_branch1, action_branch1, action_branch2)
+                cost = self.calculate_all_losses1(contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, contrast_pairs_b1, contrast_pairs_b1_2, contrast_pairs_b1_ind, contrast_pairs_m_ind, cas_top, _label, topk_indices, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2, gate_weights, embedding_mixed, embedding_branch1, action_branch1, action_branch2, epoch=epoch)
 
                 cost.backward()
                 self.optimizer.step()
