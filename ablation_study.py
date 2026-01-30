@@ -469,22 +469,22 @@ def main():
         "E6_NoReg"      # E6: 无门控正则化
     ]
     
-    print("开始运行消融实验...")
-    print("实验列表:")
+    print("ablation...")
+    print("list:")
     print("- E1-1: RGB only")
     print("- E1-2: Flow only") 
     print("- E1-3: Joint only")
-    print("- E2: 无 Mixed Expert")
-    print("- E3: Mixed Expert 无 Gate")
+    print("- E2: no Mixed Expert")
+    print("- E3: Mixed Expert no Gate")
     print("- E4: Gate-off")
-    print("- E5: 完整模型 (E5)")
-    print("- E6: 无门控正则化")
+    print("- E5: completed (E5)")
+    print("- E6: no gate")
     print()
     
     for exp in experiments:
-        print(f"正在运行实验: {exp}")
+        print(f"running experiment: {exp}")
         run_ablation_experiment(exp, args)
-        print(f"实验 {exp} 完成\n")
+        print(f"experiment: {exp} completed\n")
 
 
 if __name__ == '__main__':
