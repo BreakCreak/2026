@@ -459,9 +459,9 @@ def main():
     
     # 定义所有消融实验
     experiments = [
-        "E1_RGB",      # E1-1: RGB only
-        "E1_Flow",     # E1-2: Flow only
-        "E1_Joint",    # E1-3: Joint only
+        # "E1_RGB",      # E1-1: RGB only
+        # "E1_Flow",     # E1-2: Flow only
+        # "E1_Joint",    # E1-3: Joint only
         "E2_NoME",     # E2: 无 Mixed Expert
         "E3_ME_NoGate", # E3: Mixed Expert 无 Gate
         "E4_GateOff",   # E4: Gate-off
@@ -471,9 +471,9 @@ def main():
     
     print("ablation...")
     print("list:")
-    print("- E1-1: RGB only")
-    print("- E1-2: Flow only") 
-    print("- E1-3: Joint only")
+    # print("- E1-1: RGB only")
+    # print("- E1-2: Flow only")
+    # print("- E1-3: Joint only")
     print("- E2: no Mixed Expert")
     print("- E3: Mixed Expert no Gate")
     print("- E4: Gate-off")
