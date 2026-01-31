@@ -1,4 +1,4 @@
-python comprehensive_loss_ablation.py \
+python param_sensitivity_analysis.py \
 --exp_name Thumos_5 \
 --model_name ThumosModel \
 --num_epochs 500 \
