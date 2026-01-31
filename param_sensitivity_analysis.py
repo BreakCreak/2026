@@ -247,9 +247,6 @@ class ParamSensitivityTrainer():
 def run_param_sensitivity_analysis(args):
     """运行参数敏感性分析"""
     
-    print("开始运行损失函数参数敏感性分析...")
-    print("测试不同参数对训练结果的影响")
-    
     # 定义要测试的参数组合
     param_configs = [
         # 基准配置
