@@ -291,8 +291,8 @@ class ThumosTrainer():
         base_loss = self.criterion(cas_top, label)
         class_agnostic_loss = self.Lgce(action_flow.squeeze(1), cls_agnostic_gt.squeeze(1)) + self.Lgce(action_rgb.squeeze(1), cls_agnostic_gt.squeeze(1))
 
-        modality_consistent_loss = 0.5 * F.mse_loss(action_flow, action_rgb) + 0.5 * F.mse_loss(action_rgb, action_flow)
-        action_consistent_loss = 0.5 * F.mse_loss(actionness1, actionness2) + 0.5 * F.mse_loss(actionness2, actionness1)
+        modality_consistent_loss = F.mse_loss(action_flow, action_rgb)  # 合并为一次MSE
+        action_consistent_loss = F.mse_loss(actionness1, actionness2)
     
         # 计算门控熵损失
         gate_ent_loss = gate_entropy_loss(gate_weights)
@@ -303,8 +303,11 @@ class ThumosTrainer():
         # 增强的门控反馈机制
         gate_feedback_loss = self.calculate_gate_feedback_loss(gate_weights, action_branch1, action_branch2, topk_indices)
 
-        # 添加门控正则化项
-        cost = base_loss + class_agnostic_loss + 5*modality_consistent_loss + 0.01*loss_contrastive + 0.1*action_consistent_loss + 0.01 * gate_ent_loss + 0.02 * gate_balance_loss + 0.05 * gate_feedback_loss
+        # 调整后的对比损失权重，移除重复项，降低独立对比损失权重
+        adjusted_contrastive_loss = L_c + L_r + L_f + 0.5 * L_m  # 移除了 L_m2 和 L_b1_2
+        
+        # 提升门控反馈损失权重
+        cost = base_loss + class_agnostic_loss + 5*modality_consistent_loss + 0.1*adjusted_contrastive_loss + 0.1*action_consistent_loss + 0.01 * gate_ent_loss + 0.02 * gate_balance_loss + 0.2 * gate_feedback_loss
 
         return cost
 
