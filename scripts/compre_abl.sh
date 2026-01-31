@@ -1,4 +1,4 @@
-python param_sensitivity_analysis.py \
+python simple_param_ablation.py \
 --exp_name Thumos_5 \
 --model_name ThumosModel \
 --num_epochs 500 \
