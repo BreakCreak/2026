@@ -189,6 +189,11 @@ class ThumosTrainer():
         self.best_mAP = -1 # init
         self.step = 0
         self.total_loss_per_epoch = 0
+        
+        # 实验参数
+        self.contrastive_weight = getattr(config, 'contrastive_weight', 0.1)
+        self.action_consistent_weight = getattr(config, 'action_consistent_weight', 0.1)
+        self.gate_regularization_weight = getattr(config, 'gate_regularization_weight', 0.01)
 
 
     def test(self):
@@ -265,7 +270,8 @@ class ThumosTrainer():
         
         return gate_feedback_loss
 
-    def calculate_all_losses1(self, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, contrast_pairs_b1, contrast_pairs_b1_2, contrast_pairs_b1_ind, contrast_pairs_m_ind, cas_top, label, topk_indices, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2, gate_weights, embedding_mixed, embedding_branch1, action_branch1, action_branch2):
+    def calculate_all_losses1(self, contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, contrast_pairs_b1, contrast_pairs_b1_2, contrast_pairs_b1_ind, contrast_pairs_m_ind, cas_top, label, topk_indices, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2, gate_weights, embedding_mixed, embedding_branch1, action_branch1, action_branch2, 
+                        contrastive_weight=0.1, action_consistent_weight=0.1, gate_regularization_weight=0.01):
         self.contrastive_criterion = ContrastiveLoss()
         
         # 原有的对比损失
@@ -306,8 +312,11 @@ class ThumosTrainer():
         # 调整后的对比损失权重，移除重复项，降低独立对比损失权重
         adjusted_contrastive_loss = L_c + L_r + L_f + 0.5 * L_m  # 移除了 L_m2 和 L_b1_2
         
-        # 提升门控反馈损失权重
-        cost = base_loss + class_agnostic_loss + 5*modality_consistent_loss + 0.1*adjusted_contrastive_loss + 0.1*action_consistent_loss + 0.01 * gate_ent_loss + 0.02 * gate_balance_loss + 0.2 * gate_feedback_loss
+        # 使用传入的权重参数计算总损失
+        cost = base_loss + class_agnostic_loss + 5*modality_consistent_loss + \
+               contrastive_weight*adjusted_contrastive_loss + \
+               action_consistent_weight*action_consistent_loss + \
+               gate_regularization_weight * (gate_ent_loss + gate_balance_loss + gate_feedback_loss)
 
         return cost
 
@@ -363,7 +372,10 @@ class ThumosTrainer():
                 cls_agnostic_gt = self.calculate_pesudo_target(batch_size, _label, topk_indices)
 
                 # losses
-                cost = self.calculate_all_losses1(contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, contrast_pairs_b1, contrast_pairs_b1_2, contrast_pairs_b1_ind, contrast_pairs_m_ind, cas_top, _label, topk_indices, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2, gate_weights, embedding_mixed, embedding_branch1, action_branch1, action_branch2)
+                cost = self.calculate_all_losses1(contrast_pairs, contrast_pairs_r, contrast_pairs_f, contrast_pairs_m, contrast_pairs_m2, contrast_pairs_b1, contrast_pairs_b1_2, contrast_pairs_b1_ind, contrast_pairs_m_ind, cas_top, _label, topk_indices, action_flow, action_rgb, cls_agnostic_gt, actionness1, actionness2, gate_weights, embedding_mixed, embedding_branch1, action_branch1, action_branch2,
+                                                contrastive_weight=self.contrastive_weight,
+                                                action_consistent_weight=self.action_consistent_weight,
+                                                gate_regularization_weight=self.gate_regularization_weight)
 
                 cost.backward()
                 self.optimizer.step()
@@ -380,6 +392,14 @@ def main():
     args = parse_args()
     config = Config(args)
     set_seed(config)
+    
+    # 从命令行参数获取实验参数
+    if hasattr(args, 'contrastive_weight') and args.contrastive_weight is not None:
+        config.contrastive_weight = args.contrastive_weight
+    if hasattr(args, 'action_consistent_weight') and args.action_consistent_weight is not None:
+        config.action_consistent_weight = args.action_consistent_weight
+    if hasattr(args, 'gate_regularization_weight') and args.gate_regularization_weight is not None:
+        config.gate_regularization_weight = args.gate_regularization_weight
 
     trainer = ThumosTrainer(config)
 
