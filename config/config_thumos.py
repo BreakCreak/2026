@@ -45,6 +45,11 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=1, help='random seed (-1 for no manual seed)')  # 42
     parser.add_argument('--verbose', default=False, action='store_true')
     
+    # loss function parameters for ablation study
+    parser.add_argument('--contrastive_weight', type=float, default=0.1, help='Weight for contrastive loss')
+    parser.add_argument('--action_consistent_weight', type=float, default=0.1, help='Weight for action consistent loss')
+    parser.add_argument('--gate_regularization_weight', type=float, default=0.01, help='Weight for gate regularization loss')
+
     return init_args(parser.parse_args())
 
 
@@ -94,6 +99,10 @@ class Config(object):
         self.nms_thresh = args.nms_thresh
         self.load_weight = args.load_weight
         self.verbose = args.verbose
+        # loss function parameters
+        self.contrastive_weight = args.contrastive_weight
+        self.action_consistent_weight = args.action_consistent_weight
+        self.gate_regularization_weight = args.gate_regularization_weight
 
 
 class_dict = {
