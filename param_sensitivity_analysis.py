@@ -246,7 +246,7 @@ class ParamSensitivityTrainer():
 
 def run_param_sensitivity_analysis(args):
     """运行参数敏感性分析"""
-    
+
     # 定义要测试的参数组合
     param_configs = [
         # 基准配置
@@ -302,7 +302,7 @@ def run_param_sensitivity_analysis(args):
         }
         results.append(result)
         
-        print(f"  结果: mAP={best_mAP*100:.2f}%, Acc={final_acc*100:.2f}%")
+        print(f"result: mAP={best_mAP*100:.2f}%, Acc={final_acc*100:.2f}%")
         print()
     
     # 输出结果汇总
